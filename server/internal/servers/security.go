@@ -137,9 +137,16 @@ func (m *Manager) SecurityAudit(ctx context.Context, server *store.Server) (*Ser
 	}
 	defer conn.Release()
 
-	cmdRes, err := conn.Run(ctx, securityAuditScript)
-	if err != nil {
-		return nil, fmt.Errorf("execute security audit script: %w", err)
+	var cmdRes sshx.Result
+	if server.HasSudoPassword() {
+		cmdRes, _ = m.runSudo(ctx, server, conn, "", securityAuditScript)
+	}
+	if !cmdRes.Ok() {
+		var runErr error
+		cmdRes, runErr = conn.Run(ctx, securityAuditScript)
+		if runErr != nil && !cmdRes.Ok() {
+			return nil, fmt.Errorf("execute security audit script: %w", runErr)
+		}
 	}
 
 	audit := parseSecurityAuditOutput(cmdRes.Stdout)

@@ -75,15 +75,28 @@ const MCP_TOOLS: MCPToolDoc[] = [
   {
     name: 'dockdeploy_exec_command',
     category: 'Execution',
-    description: 'Execute arbitrary shell commands directly on a managed server host (or local server). Supports working directory, timeouts, and elevated sudo execution.',
+    description: 'Execute arbitrary shell commands directly on a managed server host (or local server). Supports working directory, timeouts, automatic sudo detection, and elevation using saved server sudo passwords.',
     params: [
-      { name: 'command', type: 'string', required: true, description: 'Shell command line to execute (e.g. "df -h", "uptime", "ps aux")' },
+      { name: 'command', type: 'string', required: true, description: 'Shell command line to execute (e.g. "df -h", "uptime", "sudo systemctl restart nginx")' },
       { name: 'server_id', type: 'string', required: false, description: 'Server ID (defaults to local or first server)' },
-      { name: 'sudo', type: 'boolean', required: false, description: 'Run elevated with root / sudo permissions' },
+      { name: 'sudo', type: 'boolean', required: false, description: 'Run elevated with root / sudo permissions. Uses saved server sudo password automatically.' },
+      { name: 'sudo_password', type: 'string', required: false, description: 'Optional one-time sudo password if not already saved' },
+      { name: 'save_sudo_password', type: 'boolean', required: false, description: 'Whether to securely encrypt and save the provided sudo_password to this server for future calls' },
       { name: 'workdir', type: 'string', required: false, description: 'Working directory path on the server' },
       { name: 'timeout_seconds', type: 'integer', required: false, description: 'Execution timeout in seconds (default 60, max 600)' },
     ],
-    example: `{\n  "name": "dockdeploy_exec_command",\n  "arguments": {\n    "command": "uname -a && df -h /",\n    "sudo": false\n  }\n}`,
+    example: `{\n  "name": "dockdeploy_exec_command",\n  "arguments": {\n    "command": "systemctl restart nginx",\n    "sudo": true\n  }\n}`,
+  },
+  {
+    name: 'dockdeploy_set_server_sudo_password',
+    category: 'Execution',
+    description: 'Save, verify, or clear the sudo password for a managed server. dockdeploy tests the password on the server first, then encrypts and saves it so future elevated commands, Docker operations, and root file edits run automatically without prompting.',
+    params: [
+      { name: 'sudo_password', type: 'string', required: true, description: 'The sudo password to verify and securely save' },
+      { name: 'server_id', type: 'string', required: false, description: 'Server ID (defaults to local or first server)' },
+      { name: 'clear', type: 'boolean', required: false, description: 'If true, clears/deletes the stored sudo password from the server' },
+    ],
+    example: `{\n  "name": "dockdeploy_set_server_sudo_password",\n  "arguments": {\n    "sudo_password": "mySecureServerPassword123"\n  }\n}`,
   },
   {
     name: 'dockdeploy_docker_exec',
@@ -95,7 +108,9 @@ const MCP_TOOLS: MCPToolDoc[] = [
       { name: 'user', type: 'string', required: false, description: 'User or UID to execute as inside container (e.g. "root")' },
       { name: 'workdir', type: 'string', required: false, description: 'Working directory inside the container' },
       { name: 'server_id', type: 'string', required: false, description: 'Server ID' },
-      { name: 'sudo', type: 'boolean', required: false, description: 'Run docker exec with host sudo elevation' },
+      { name: 'sudo', type: 'boolean', required: false, description: 'Run docker exec with host sudo elevation (uses saved password)' },
+      { name: 'sudo_password', type: 'string', required: false, description: 'Optional one-time sudo password if needed' },
+      { name: 'save_sudo_password', type: 'boolean', required: false, description: 'Whether to save the provided sudo_password for future calls' },
     ],
     example: `{\n  "name": "dockdeploy_docker_exec",\n  "arguments": {\n    "container_id": "api-service",\n    "command": "env && cat /app/config.json"\n  }\n}`,
   },
@@ -118,7 +133,8 @@ const MCP_TOOLS: MCPToolDoc[] = [
       { name: 'path', type: 'string', required: true, description: 'Absolute file path to write on the server' },
       { name: 'content', type: 'string', required: true, description: 'Full text content to write into the file' },
       { name: 'server_id', type: 'string', required: false, description: 'Server ID' },
-      { name: 'sudo_password', type: 'string', required: false, description: 'Sudo password if writing to root-protected locations' },
+      { name: 'sudo_password', type: 'string', required: false, description: 'Optional sudo password if writing to root-protected locations (uses saved password automatically if configured)' },
+      { name: 'save_sudo_password', type: 'boolean', required: false, description: 'Whether to save the provided sudo_password for future operations' },
     ],
     example: `{\n  "name": "dockdeploy_write_file",\n  "arguments": {\n    "path": "/etc/environment",\n    "content": "NODE_ENV=production\\n"\n  }\n}`,
   },
@@ -853,6 +869,28 @@ export function Docs() {
                     language="json"
                   />
                 </div>
+              </div>
+
+              {/* Sudo & Elevation Info Box */}
+              <div className="rounded-xl border border-primary/30 bg-primary/5 p-5 space-y-3">
+                <div className="flex items-center gap-2">
+                  <Key className="size-4.5 text-primary" />
+                  <h3 className="text-sm font-semibold text-primary">Sudo Commands & Saved Passwords</h3>
+                </div>
+                <p className="text-xs sm:text-sm text-zinc-300 leading-relaxed">
+                  When your AI coding agent executes operations requiring root privileges (like <code className="text-xs">systemctl restart</code>, package installation, editing <code className="text-xs">/etc/nginx</code>, or interacting with a root-owned Docker daemon):
+                </p>
+                <ul className="list-disc pl-5 text-xs sm:text-sm text-zinc-300 space-y-1.5">
+                  <li>
+                    <strong>Saved Sudo Password:</strong> If a server has its sudo password saved in dockdeploy (or configured via <code className="text-xs">dockdeploy_set_server_sudo_password</code>), commands with <code className="text-xs">sudo: true</code> automatically use it without prompting.
+                  </li>
+                  <li>
+                    <strong>Auto-Detection & Auto-Elevation:</strong> If an AI runs a command starting with <code className="text-xs">sudo ...</code>, or if a non-elevated command fails with permission denial, dockdeploy automatically elevates with the saved sudo password.
+                  </li>
+                  <li>
+                    <strong>Passwordless Sudo & Root:</strong> Servers connecting as <code className="text-xs">root</code> or with <code className="text-xs">NOPASSWD</code> in sudoers execute immediately without requiring any password.
+                  </li>
+                </ul>
               </div>
             </CardContent>
           </Card>

@@ -113,7 +113,10 @@ func (m *Manager) runSudo(ctx context.Context, server *store.Server, conn *sshx.
 	} else if caps.SudoMode == sshx.SudoNoPassword {
 		fullCmd = "sudo -n sh -c " + shellQuote(cmd)
 	} else {
-		return sshx.Result{ExitCode: 1}, ErrSudoPasswordRequired
+		return sshx.Result{
+			ExitCode: 1,
+			Stderr:   "sudo password is required on this server but none was saved or provided",
+		}, ErrSudoPasswordRequired
 	}
 
 	res, err := conn.Run(ctx, fullCmd)

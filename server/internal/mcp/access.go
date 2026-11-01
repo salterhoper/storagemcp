@@ -35,8 +35,9 @@ func callerFrom(ctx context.Context) (*Caller, bool) {
 var toolPermissions = map[string]auth.Permission{
 	"dockdeploy_list_servers":        auth.PermServerRead,
 	"dockdeploy_get_server":          auth.PermServerRead,
-	"dockdeploy_exec_command":        auth.PermServerWrite,
-	"dockdeploy_docker_exec":         auth.PermContainerOperate,
+	"dockdeploy_exec_command":             auth.PermServerWrite,
+	"dockdeploy_set_server_sudo_password": auth.PermServerWrite,
+	"dockdeploy_docker_exec":              auth.PermContainerOperate,
 	"dockdeploy_list_containers":     auth.PermServerRead,
 	"dockdeploy_inspect_container":   auth.PermServerRead,
 	"dockdeploy_container_action":    auth.PermContainerOperate,

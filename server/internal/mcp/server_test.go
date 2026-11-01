@@ -46,6 +46,7 @@ func TestMCPServerToolsList(t *testing.T) {
 		"dockdeploy_list_servers",
 		"dockdeploy_get_server",
 		"dockdeploy_exec_command",
+		"dockdeploy_set_server_sudo_password",
 		"dockdeploy_docker_exec",
 		"dockdeploy_list_containers",
 		"dockdeploy_inspect_container",

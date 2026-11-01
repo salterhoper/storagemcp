@@ -120,14 +120,38 @@ func (m *Manager) Probe(ctx context.Context, server *store.Server) (*sshx.Capabi
 	return caps, nil
 }
 
-// RunCommand executes a shell command on the target server. If elevated is true,
-// it executes the command using the server's configured sudo mode or provided password.
+// CleanSudoCmd strips redundant leading sudo prefixes from commands so they can
+// be cleanly wrapped in elevation harnesses without nested invocation problems.
+func CleanSudoCmd(cmd string) string {
+	trimmed := strings.TrimSpace(cmd)
+	for {
+		if strings.HasPrefix(trimmed, "sudo ") {
+			trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "sudo "))
+			continue
+		}
+		if strings.HasPrefix(trimmed, "sudo\t") {
+			trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "sudo\t"))
+			continue
+		}
+		break
+	}
+	return trimmed
+}
+
+// RunCommand executes a shell command on the target server. If elevated is true
+// (or if the command starts with "sudo "), it executes using the server's
+// configured sudo mode, saved sudo password, or provided one-time password.
 func (m *Manager) RunCommand(ctx context.Context, server *store.Server, cmd string, elevated bool, sudoPasswords ...string) (sshx.Result, error) {
 	conn, err := m.Connect(ctx, server)
 	if err != nil {
 		return sshx.Result{}, err
 	}
 	defer conn.Release()
+
+	trimmed := strings.TrimSpace(cmd)
+	if !elevated && (strings.HasPrefix(trimmed, "sudo ") || strings.HasPrefix(trimmed, "sudo\t")) {
+		elevated = true
+	}
 
 	if !elevated {
 		return conn.Run(ctx, cmd)
@@ -137,11 +161,16 @@ func (m *Manager) RunCommand(ctx context.Context, server *store.Server, cmd stri
 	if len(sudoPasswords) > 0 {
 		sudoPassword = sudoPasswords[0]
 	}
-	return m.runSudo(ctx, server, conn, sudoPassword, cmd)
+	return m.runSudo(ctx, server, conn, sudoPassword, CleanSudoCmd(cmd))
 }
 
 // RunCommandInDir executes a shell command inside a specified directory on the target server.
 func (m *Manager) RunCommandInDir(ctx context.Context, server *store.Server, dir, cmd string, elevated bool, sudoPasswords ...string) (sshx.Result, error) {
+	trimmedCmd := strings.TrimSpace(cmd)
+	if !elevated && (strings.HasPrefix(trimmedCmd, "sudo ") || strings.HasPrefix(trimmedCmd, "sudo\t")) {
+		elevated = true
+		cmd = CleanSudoCmd(cmd)
+	}
 	fullCmd := cmd
 	if strings.TrimSpace(dir) != "" {
 		fullCmd = fmt.Sprintf("cd %s && %s", shellQuote(dir), cmd)

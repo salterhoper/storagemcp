@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -567,7 +568,7 @@ func (s *Server) toolDefinitions() []map[string]any {
 		},
 		{
 			"name":        "dockdeploy_exec_command",
-			"description": "Execute a shell command directly on a managed server (or host). Supports working directory, execution timeouts, and optional sudo/root elevation.",
+			"description": "Execute a shell command directly on a managed server (or host). Supports working directory, execution timeouts, automatic sudo detection, and elevation using saved server sudo passwords.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -581,11 +582,15 @@ func (s *Server) toolDefinitions() []map[string]any {
 					},
 					"sudo": map[string]any{
 						"type":        "boolean",
-						"description": "Whether to execute the command with elevated sudo/root privileges (default: false)",
+						"description": "Whether to execute the command with elevated sudo/root privileges (default: false). When true (or if command begins with 'sudo '), dockdeploy automatically uses the server's saved sudo password if configured.",
 					},
 					"sudo_password": map[string]any{
 						"type":        "string",
-						"description": "One-time sudo password if required",
+						"description": "Optional one-time sudo password. If omitted, dockdeploy uses the server's saved sudo password automatically.",
+					},
+					"save_sudo_password": map[string]any{
+						"type":        "boolean",
+						"description": "Whether to securely save the provided sudo_password to this server for future elevated commands (default: false)",
 					},
 					"workdir": map[string]any{
 						"type":        "string",
@@ -597,6 +602,27 @@ func (s *Server) toolDefinitions() []map[string]any {
 					},
 				},
 				"required": []string{"command"},
+			},
+		},
+		{
+			"name":        "dockdeploy_set_server_sudo_password",
+			"description": "Save, verify, or clear the sudo password for a managed server. dockdeploy tests the password on the server first, then encrypts and saves it so future elevated commands, Docker operations, and root file edits run automatically without prompting.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"server_id": map[string]any{
+						"type":        "string",
+						"description": "Server ID (optional, defaults to local or first server)",
+					},
+					"sudo_password": map[string]any{
+						"type":        "string",
+						"description": "The sudo password to test and save",
+					},
+					"clear": map[string]any{
+						"type":        "boolean",
+						"description": "If true, clears/deletes the stored sudo password from the server (default: false)",
+					},
+				},
 			},
 		},
 		{
@@ -627,11 +653,15 @@ func (s *Server) toolDefinitions() []map[string]any {
 					},
 					"sudo": map[string]any{
 						"type":        "boolean",
-						"description": "Run docker exec with host sudo elevation if docker socket requires root (default: false)",
+						"description": "Run docker exec with host sudo elevation if docker socket requires root (default: false). Automatically uses server's saved sudo password if configured.",
 					},
 					"sudo_password": map[string]any{
 						"type":        "string",
-						"description": "One-time sudo password if required",
+						"description": "Optional one-time sudo password if required",
+					},
+					"save_sudo_password": map[string]any{
+						"type":        "boolean",
+						"description": "Whether to securely save the provided sudo_password to this server (default: false)",
 					},
 					"timeout_seconds": map[string]any{
 						"type":        "integer",
@@ -757,6 +787,10 @@ func (s *Server) toolDefinitions() []map[string]any {
 						"type":        "integer",
 						"description": "Maximum bytes to read (default: 65536)",
 					},
+					"sudo_password": map[string]any{
+						"type":        "string",
+						"description": "Optional one-time sudo password if reading root-restricted files (dockdeploy automatically uses saved sudo password if configured)",
+					},
 				},
 				"required": []string{"path"},
 			},
@@ -781,7 +815,11 @@ func (s *Server) toolDefinitions() []map[string]any {
 					},
 					"sudo_password": map[string]any{
 						"type":        "string",
-						"description": "Sudo password if writing to root-protected paths",
+						"description": "Sudo password if writing to root-protected paths (dockdeploy automatically uses saved sudo password if configured)",
+					},
+					"save_sudo_password": map[string]any{
+						"type":        "boolean",
+						"description": "Whether to securely save the provided sudo_password to this server for future elevated commands (default: false)",
 					},
 				},
 				"required": []string{"path", "content"},
@@ -895,8 +933,8 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		var sb strings.Builder
 		sb.WriteString(fmt.Sprintf("Found %d managed server(s):\n\n", len(serversList)))
 		for _, srv := range serversList {
-			sb.WriteString(fmt.Sprintf("- **%s** (`%s`)\n  Host: `%s`, Status: `%s`, Auth: `%s`, Docker: `%s`\n",
-				srv.Name, srv.ID, srv.Host, srv.Status, srv.AuthMethod, srv.DockerSocket))
+			sb.WriteString(fmt.Sprintf("- **%s** (`%s`)\n  Host: `%s`, Status: `%s`, Sudo Saved: `%t`, Auth: `%s`, Docker: `%s`\n",
+				srv.Name, srv.ID, srv.Host, srv.Status, srv.HasSudoPassword(), srv.AuthMethod, srv.DockerSocket))
 		}
 		return sb.String(), nil
 
@@ -922,6 +960,7 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		sb.WriteString(fmt.Sprintf("- **Auth Method**: `%s`\n", server.AuthMethod))
 		sb.WriteString(fmt.Sprintf("- **Status**: `%s`\n", server.Status))
 		sb.WriteString(fmt.Sprintf("- **Docker Socket**: `%s`\n", server.DockerSocket))
+		sb.WriteString(fmt.Sprintf("- **Has Saved Sudo Password**: `%t`\n", server.HasSudoPassword()))
 		if server.LastSeenAt != nil {
 			sb.WriteString(fmt.Sprintf("- **Last Seen**: `%s`\n", server.LastSeenAt.Format(time.RFC3339)))
 		}
@@ -963,6 +1002,7 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		}
 		sudo := getBool(args, "sudo", false)
 		sudoPassword := getString(args, "sudo_password")
+		saveSudoPassword := getBool(args, "save_sudo_password", false)
 		workdir := getString(args, "workdir")
 		timeoutSec := getInt(args, "timeout_seconds", 60)
 		if timeoutSec <= 0 || timeoutSec > 600 {
@@ -972,6 +1012,18 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		server, err := s.resolveServer(ctx, serverID)
 		if err != nil {
 			return "", err
+		}
+
+		// Save sudo password to server store if requested
+		if saveSudoPassword && sudoPassword != "" && server.ID != "" && server.ID != "local" {
+			_ = s.Store.SetServerSudoPassword(ctx, s.Sealer, server.ID, sudoPassword)
+		}
+
+		// Auto-detect sudo in command line
+		trimmedCmd := strings.TrimSpace(command)
+		if strings.HasPrefix(trimmedCmd, "sudo ") || strings.HasPrefix(trimmedCmd, "sudo\t") {
+			sudo = true
+			command = servers.CleanSudoCmd(command)
 		}
 
 		cmdCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
@@ -984,6 +1036,26 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		} else {
 			res, err = s.Servers.RunCommand(cmdCtx, server, command, sudo, sudoPassword)
 		}
+
+		// Auto-elevate with saved sudo password if command failed due to permissions
+		autoElevated := false
+		if !sudo && isPermissionDenied(res, err) {
+			cleanCmd := servers.CleanSudoCmd(command)
+			var elevatedRes sshx.Result
+			var elevatedErr error
+			if workdir != "" {
+				elevatedRes, elevatedErr = s.Servers.RunCommandInDir(cmdCtx, server, workdir, cleanCmd, true)
+			} else {
+				elevatedRes, elevatedErr = s.Servers.RunCommand(cmdCtx, server, cleanCmd, true)
+			}
+			if elevatedErr == nil && (elevatedRes.Ok() || elevatedRes.ExitCode == 0) {
+				res = elevatedRes
+				err = nil
+				autoElevated = true
+				sudo = true
+			}
+		}
+
 		duration := time.Since(start).Round(time.Millisecond)
 
 		var sb strings.Builder
@@ -991,7 +1063,11 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		if workdir != "" {
 			sb.WriteString(fmt.Sprintf("- Working Dir: `%s`\n", workdir))
 		}
-		sb.WriteString(fmt.Sprintf("- Elevated (sudo): `%t`\n", sudo))
+		if autoElevated {
+			sb.WriteString("- Elevated (sudo): `true` *(auto-elevated using server's saved sudo password)*\n")
+		} else {
+			sb.WriteString(fmt.Sprintf("- Elevated (sudo): `%t`\n", sudo))
+		}
 		sb.WriteString(fmt.Sprintf("- Duration: `%s`\n", duration))
 		sb.WriteString(fmt.Sprintf("- Exit Code: `%d`\n\n", res.ExitCode))
 
@@ -1015,10 +1091,68 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 			sb.WriteString("```\n")
 		}
 
-		if err != nil && res.ExitCode == 0 {
+		if err != nil {
+			if res.ExitCode == 0 {
+				res.ExitCode = 1
+			}
+			if res.Stderr == "" {
+				res.Stderr = err.Error()
+			}
 			sb.WriteString(fmt.Sprintf("\n**Execution error:** %v\n", err))
+			if errors.Is(err, servers.ErrSudoPasswordRequired) {
+				sb.WriteString("\n> ⚠️ **Sudo Authentication Required**: This server requires a sudo password. Please save it for this server using `dockdeploy_set_server_sudo_password` or pass `sudo_password`.\n")
+			}
+		} else if !sudo && isPermissionDenied(res, nil) {
+			sb.WriteString("\n> 💡 **Tip**: This command may have failed due to permissions. You can re-run with `sudo: true`. If this server requires a sudo password, save it once via `dockdeploy_set_server_sudo_password` and all future sudo commands will execute seamlessly.\n")
 		}
+
 		return sb.String(), nil
+
+	case "dockdeploy_set_server_sudo_password":
+		serverID := getString(args, "server_id")
+		sudoPassword := getString(args, "sudo_password")
+		clear := getBool(args, "clear", false)
+
+		server, err := s.resolveServer(ctx, serverID)
+		if err != nil {
+			return "", err
+		}
+
+		if clear || sudoPassword == "" {
+			if err := s.Store.SetServerSudoPassword(ctx, s.Sealer, server.ID, ""); err != nil {
+				return "", fmt.Errorf("clear sudo password: %w", err)
+			}
+			return fmt.Sprintf("✅ Sudo password has been cleared for server **%s** (`%s`).", server.Name, server.ID), nil
+		}
+
+		// Verify sudo password by testing elevation on the target server
+		testRes, testErr := s.Servers.RunCommand(ctx, server, "echo __dockdeploy_sudo_ok__", true, sudoPassword)
+		if testErr != nil || !testRes.Ok() || !strings.Contains(testRes.Stdout, "__dockdeploy_sudo_ok__") {
+			errMsg := testRes.Stderr
+			if errMsg == "" && testErr != nil {
+				errMsg = testErr.Error()
+			}
+			if errMsg == "" {
+				errMsg = "incorrect password or sudo elevation failed"
+			}
+			return fmt.Sprintf("❌ Failed to verify sudo password on server **%s** (`%s`):\n```\n%s\n```\nThe password was NOT saved. Please ensure the password is correct.", server.Name, server.ID, strings.TrimSpace(errMsg)), nil
+		}
+
+		// Save encrypted sudo password to the database
+		if err := s.Store.SetServerSudoPassword(ctx, s.Sealer, server.ID, sudoPassword); err != nil {
+			return "", fmt.Errorf("save sudo password: %w", err)
+		}
+
+		// Trigger background probe to update server capabilities
+		go func() {
+			probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if srv, err := s.Store.ServerByID(probeCtx, server.ID); err == nil {
+				_, _ = s.Servers.Probe(probeCtx, srv)
+			}
+		}()
+
+		return fmt.Sprintf("✅ Sudo password verified and securely saved for server **%s** (`%s`).\n\nAll subsequent MCP commands (e.g. `dockdeploy_exec_command`, `dockdeploy_write_file`, `dockdeploy_docker_exec`) on this server can now use sudo elevation automatically without prompting for a password.", server.Name, server.ID), nil
 
 	case "dockdeploy_docker_exec":
 		serverID := getString(args, "server_id")
@@ -1034,6 +1168,7 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		workdir := getString(args, "workdir")
 		sudo := getBool(args, "sudo", false)
 		sudoPassword := getString(args, "sudo_password")
+		saveSudoPassword := getBool(args, "save_sudo_password", false)
 		timeoutSec := getInt(args, "timeout_seconds", 60)
 		if timeoutSec <= 0 || timeoutSec > 600 {
 			timeoutSec = 60
@@ -1044,8 +1179,9 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 			return "", err
 		}
 
-		cmdCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
-		defer cancel()
+		if saveSudoPassword && sudoPassword != "" && server.ID != "" && server.ID != "local" {
+			_ = s.Store.SetServerSudoPassword(ctx, s.Sealer, server.ID, sudoPassword)
+		}
 
 		var dockerArgs []string
 		dockerArgs = append(dockerArgs, "docker", "exec", "-i")
@@ -1058,12 +1194,31 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		dockerArgs = append(dockerArgs, servers.ShellQuote(containerID), "sh", "-c", servers.ShellQuote(command))
 		fullExecCmd := strings.Join(dockerArgs, " ")
 
+		cmdCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+		defer cancel()
+
 		start := time.Now()
 		res, err := s.Servers.RunCommand(cmdCtx, server, fullExecCmd, sudo, sudoPassword)
+
+		autoElevated := false
+		if !sudo && isPermissionDenied(res, err) {
+			elevatedRes, elevatedErr := s.Servers.RunCommand(cmdCtx, server, fullExecCmd, true)
+			if elevatedErr == nil && (elevatedRes.Ok() || elevatedRes.ExitCode == 0) {
+				res = elevatedRes
+				err = nil
+				autoElevated = true
+				sudo = true
+			}
+		}
 		duration := time.Since(start).Round(time.Millisecond)
 
 		var sb strings.Builder
 		sb.WriteString(fmt.Sprintf("Docker Exec on container `%s` (server: **%s**)\n", containerID, server.Name))
+		if autoElevated {
+			sb.WriteString("- Elevated (sudo): `true` *(auto-elevated using server's saved sudo password)*\n")
+		} else if sudo {
+			sb.WriteString("- Elevated (sudo): `true`\n")
+		}
 		sb.WriteString(fmt.Sprintf("- Duration: `%s`\n", duration))
 		sb.WriteString(fmt.Sprintf("- Exit Code: `%d`\n\n", res.ExitCode))
 
@@ -1087,7 +1242,13 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 			sb.WriteString("```\n")
 		}
 
-		if err != nil && res.ExitCode == 0 {
+		if err != nil {
+			if res.ExitCode == 0 {
+				res.ExitCode = 1
+			}
+			if res.Stderr == "" {
+				res.Stderr = err.Error()
+			}
 			sb.WriteString(fmt.Sprintf("\n**Execution error:** %v\n", err))
 		}
 		return sb.String(), nil
@@ -1282,13 +1443,19 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		if maxBytes <= 0 || maxBytes > 2*1024*1024 {
 			maxBytes = 65536
 		}
+		sudoPassword := getString(args, "sudo_password")
 
 		server, err := s.resolveServer(ctx, serverID)
 		if err != nil {
 			return "", err
 		}
 
-		fileContent, err := s.Servers.ReadFileContent(ctx, server, path, maxBytes)
+		var fileContent *servers.FileContent
+		if sudoPassword != "" {
+			fileContent, err = s.Servers.ReadFileContent(ctx, server, path, maxBytes, sudoPassword)
+		} else {
+			fileContent, err = s.Servers.ReadFileContent(ctx, server, path, maxBytes)
+		}
 		if err != nil {
 			return "", fmt.Errorf("read file %q: %w", path, err)
 		}
@@ -1311,10 +1478,15 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		// and leading indentation from config files.
 		content, _ := args["content"].(string)
 		sudoPassword := getString(args, "sudo_password")
+		saveSudoPassword := getBool(args, "save_sudo_password", false)
 
 		server, err := s.resolveServer(ctx, serverID)
 		if err != nil {
 			return "", err
+		}
+
+		if saveSudoPassword && sudoPassword != "" && server.ID != "" && server.ID != "local" {
+			_ = s.Store.SetServerSudoPassword(ctx, s.Sealer, server.ID, sudoPassword)
 		}
 
 		if err := s.Servers.WriteFileContent(ctx, server, path, content, sudoPassword); err != nil {
@@ -1592,4 +1764,35 @@ func getBool(args map[string]any, key string, fallback bool) bool {
 		}
 	}
 	return fallback
+}
+
+func isPermissionDenied(res sshx.Result, err error) bool {
+	if res.ExitCode == 0 && err == nil {
+		return false
+	}
+	combined := strings.ToLower(res.Stderr + " " + res.Stdout)
+	if err != nil {
+		combined += " " + strings.ToLower(err.Error())
+	}
+	patterns := []string{
+		"permission denied",
+		"operation not permitted",
+		"must be run as root",
+		"you must be root",
+		"need to be root",
+		"only root can do that",
+		"interactive authentication required",
+		"a terminal is required to read the password",
+		"a password is required",
+		"dial unix /var/run/docker.sock: connect: permission denied",
+		"got permission denied while trying to connect to the docker daemon socket",
+		"access denied",
+		"root privileges required",
+	}
+	for _, p := range patterns {
+		if strings.Contains(combined, p) {
+			return true
+		}
+	}
+	return false
 }
