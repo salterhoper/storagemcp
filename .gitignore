@@ -1,17 +1,81 @@
+# Environment & Secrets
 .env
+.env.*
+!.env.example
 *.local
-plan.md
-
-# Compiled binaries
-/dockdeploy
-/server/cmd/dockdeploy/dockdeploy
-
-# SQLite databases & keys
-*.db
-*.db-shm
-*.db-wal
 *.key
 *.db.key
+*.pem
+*.crt
+*.cert
+*.pfx
+*.p12
+id_rsa*
+id_ed25519*
+!server/internal/dockerx/testdata/.gitignore
+
+# SQLite databases & transient storage
+*.db
+*.db-*
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Compiled binaries & build artifacts
+dockdeploy
+*/dockdeploy
+server/dockdeploy
+/dockdeploy
+/server/dockdeploy
+/server/cmd/dockdeploy/dockdeploy
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
 
 # Node / Frontend build artifacts
 node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+*.tsbuildinfo
+.npm
+.yarn/cache
+.yarn/unplugged
+.pnpm-store
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# OS & Editor files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.sw?
+*~
+*.bak
+
+# Temporary & coverage files
+coverage.out
+coverage.html
+profile.out
+*.tmp
+plan.md
